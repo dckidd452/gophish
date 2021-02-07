@@ -7,9 +7,13 @@
 _obj
 _test
 
+# Node Modules
+node_modules
+
 # Architecture specific extensions/prefixes
 *.[568vq]
 [568vq].out
+.DS_Store
 
 *.cgo1.go
 *.cgo2.c
@@ -19,5 +23,9 @@ _cgo_export.*
 
 _testmain.go
 
+gophish_admin.crt
+gophish_admin.key
+
 *.exe
-*.db
+gophish.db*
+gophish

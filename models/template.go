@@ -4,6 +4,7 @@ import (
 	"errors"
 	"time"
 
+	log "github.com/gophish/gophish/logger"
 	"github.com/jinzhu/gorm"
 )
 
@@ -33,6 +34,12 @@ func (t *Template) Validate() error {
 	case t.Text == "" && t.HTML == "":
 		return ErrTemplateMissingParameter
 	}
+	if err := ValidateTemplate(t.HTML); err != nil {
+		return err
+	}
+	if err := ValidateTemplate(t.Text); err != nil {
+		return err
+	}
 	return nil
 }
 
@@ -41,16 +48,17 @@ func GetTemplates(uid int64) ([]Template, error) {
 	ts := []Template{}
 	err := db.Where("user_id=?", uid).Find(&ts).Error
 	if err != nil {
-		Logger.Println(err)
+		log.Error(err)
 		return ts, err
 	}
-	for i, _ := range ts {
+	for i := range ts {
+		// Get Attachments
 		err = db.Where("template_id=?", ts[i].Id).Find(&ts[i].Attachments).Error
 		if err == nil && len(ts[i].Attachments) == 0 {
 			ts[i].Attachments = make([]Attachment, 0)
 		}
-		if err != nil && err != gorm.RecordNotFound {
-			Logger.Println(err)
+		if err != nil && err != gorm.ErrRecordNotFound {
+			log.Error(err)
 			return ts, err
 		}
 	}
@@ -62,12 +70,14 @@ func GetTemplate(id int64, uid int64) (Template, error) {
 	t := Template{}
 	err := db.Where("user_id=? and id=?", uid, id).Find(&t).Error
 	if err != nil {
-		Logger.Println(err)
+		log.Error(err)
 		return t, err
 	}
+
+	// Get Attachments
 	err = db.Where("template_id=?", t.Id).Find(&t.Attachments).Error
-	if err != nil && err != gorm.RecordNotFound {
-		Logger.Println(err)
+	if err != nil && err != gorm.ErrRecordNotFound {
+		log.Error(err)
 		return t, err
 	}
 	if err == nil && len(t.Attachments) == 0 {
@@ -81,7 +91,18 @@ func GetTemplateByName(n string, uid int64) (Template, error) {
 	t := Template{}
 	err := db.Where("user_id=? and name=?", uid, n).Find(&t).Error
 	if err != nil {
-		Logger.Println(err)
+		log.Error(err)
+		return t, err
+	}
+
+	// Get Attachments
+	err = db.Where("template_id=?", t.Id).Find(&t.Attachments).Error
+	if err != nil && err != gorm.ErrRecordNotFound {
+		log.Error(err)
+		return t, err
+	}
+	if err == nil && len(t.Attachments) == 0 {
+		t.Attachments = make([]Attachment, 0)
 	}
 	return t, err
 }
@@ -92,17 +113,18 @@ func PostTemplate(t *Template) error {
 	if err := t.Validate(); err != nil {
 		return err
 	}
-	err = db.Save(t).Error
+	err := db.Save(t).Error
 	if err != nil {
-		Logger.Println(err)
+		log.Error(err)
 		return err
 	}
-	for i, _ := range t.Attachments {
-		Logger.Println(t.Attachments[i].Name)
+
+	// Save every attachment
+	for i := range t.Attachments {
 		t.Attachments[i].TemplateId = t.Id
 		err := db.Save(&t.Attachments[i]).Error
 		if err != nil {
-			Logger.Println(err)
+			log.Error(err)
 			return err
 		}
 	}
@@ -116,25 +138,27 @@ func PutTemplate(t *Template) error {
 		return err
 	}
 	// Delete all attachments, and replace with new ones
-	err = db.Where("template_id=?", t.Id).Delete(&Attachment{}).Error
-	if err != nil && err != gorm.RecordNotFound {
-		Logger.Println(err)
+	err := db.Where("template_id=?", t.Id).Delete(&Attachment{}).Error
+	if err != nil && err != gorm.ErrRecordNotFound {
+		log.Error(err)
 		return err
 	}
-	if err == gorm.RecordNotFound {
+	if err == gorm.ErrRecordNotFound {
 		err = nil
 	}
-	for i, _ := range t.Attachments {
+	for i := range t.Attachments {
 		t.Attachments[i].TemplateId = t.Id
 		err := db.Save(&t.Attachments[i]).Error
 		if err != nil {
-			Logger.Println(err)
+			log.Error(err)
 			return err
 		}
 	}
+
+	// Save final template
 	err = db.Where("id=?", t.Id).Save(t).Error
 	if err != nil {
-		Logger.Println(err)
+		log.Error(err)
 		return err
 	}
 	return nil
@@ -143,14 +167,17 @@ func PutTemplate(t *Template) error {
 // DeleteTemplate deletes an existing template in the database.
 // An error is returned if a template with the given user id and template id is not found.
 func DeleteTemplate(id int64, uid int64) error {
+	// Delete attachments
 	err := db.Where("template_id=?", id).Delete(&Attachment{}).Error
 	if err != nil {
-		Logger.Println(err)
+		log.Error(err)
 		return err
 	}
+
+	// Finally, delete the template itself
 	err = db.Where("user_id=?", uid).Delete(Template{Id: id}).Error
 	if err != nil {
-		Logger.Println(err)
+		log.Error(err)
 		return err
 	}
 	return nil

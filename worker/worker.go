@@ -1,200 +1,157 @@
 package worker
 
 import (
-	"bytes"
-	"errors"
-	"log"
-	"net/mail"
-	"net/smtp"
-	"os"
-	"strings"
-	"text/template"
+	"context"
+	"time"
 
+	log "github.com/gophish/gophish/logger"
+	"github.com/gophish/gophish/mailer"
 	"github.com/gophish/gophish/models"
-	"github.com/jordan-wright/email"
+	"github.com/sirupsen/logrus"
 )
 
-// Logger is the logger for the worker
-var Logger = log.New(os.Stdout, " ", log.Ldate|log.Ltime|log.Lshortfile)
+// Worker is an interface that defines the operations needed for a background worker
+type Worker interface {
+	Start()
+	LaunchCampaign(c models.Campaign)
+	SendTestEmail(s *models.EmailRequest) error
+}
 
-// Worker is the background worker that handles watching for new campaigns and sending emails appropriately.
-type Worker struct {
-	Queue chan *models.Campaign
+// DefaultWorker is the background worker that handles watching for new campaigns and sending emails appropriately.
+type DefaultWorker struct {
+	mailer mailer.Mailer
 }
 
 // New creates a new worker object to handle the creation of campaigns
-func New() *Worker {
-	return &Worker{
-		Queue: make(chan *models.Campaign),
+func New(options ...func(Worker) error) (Worker, error) {
+	defaultMailer := mailer.NewMailWorker()
+	w := &DefaultWorker{
+		mailer: defaultMailer,
+	}
+	for _, opt := range options {
+		if err := opt(w); err != nil {
+			return nil, err
+		}
+	}
+	return w, nil
+}
+
+// WithMailer sets the mailer for a given worker.
+// By default, workers use a standard, default mailworker.
+func WithMailer(m mailer.Mailer) func(*DefaultWorker) error {
+	return func(w *DefaultWorker) error {
+		w.mailer = m
+		return nil
 	}
 }
 
-// Start launches the worker to monitor the database for any jobs.
-// If a job is found, it launches the job
-func (w *Worker) Start() {
-	Logger.Println("Background Worker Started Successfully - Waiting for Campaigns")
-	for {
-		processCampaign(<-w.Queue)
-	}
-}
-
-func processCampaign(c *models.Campaign) {
-	Logger.Printf("Worker received: %s", c.Name)
-	err := c.UpdateStatus(models.CAMPAIGN_IN_PROGRESS)
+// processCampaigns loads maillogs scheduled to be sent before the provided
+// time and sends them to the mailer.
+func (w *DefaultWorker) processCampaigns(t time.Time) error {
+	ms, err := models.GetQueuedMailLogs(t.UTC())
 	if err != nil {
-		Logger.Println(err)
-	}
-	e := email.Email{
-		Subject: c.Template.Subject,
-		From:    c.SMTP.FromAddress,
-	}
-	var auth smtp.Auth
-	if c.SMTP.Username != "" && c.SMTP.Password != "" {
-		auth = smtp.PlainAuth("", c.SMTP.Username, c.SMTP.Password, strings.Split(c.SMTP.Host, ":")[0])
-	}
-	f, err := mail.ParseAddress(c.SMTP.FromAddress)
-	if err != nil {
-		Logger.Println(err)
-	}
-	ft := f.Name
-	if ft == "" {
-		ft = f.Address
-	}
-	for _, t := range c.Results {
-		td := struct {
-			models.Result
-			URL         string
-			TrackingURL string
-			Tracker     string
-			From        string
-		}{
-			t,
-			c.URL + "?rid=" + t.RId,
-			c.URL + "/track?rid=" + t.RId,
-			"<img src='" + c.URL + "/track?rid=" + t.RId + "'/>",
-			ft,
-		}
-		// Parse the templates
-		var subjBuff bytes.Buffer
-		var htmlBuff bytes.Buffer
-		var textBuff bytes.Buffer
-		tmpl, err := template.New("html_template").Parse(c.Template.HTML)
-		if err != nil {
-			Logger.Println(err)
-		}
-		err = tmpl.Execute(&htmlBuff, td)
-		if err != nil {
-			Logger.Println(err)
-		}
-		e.HTML = htmlBuff.Bytes()
-		tmpl, err = template.New("text_template").Parse(c.Template.Text)
-		if err != nil {
-			Logger.Println(err)
-		}
-		err = tmpl.Execute(&textBuff, td)
-		if err != nil {
-			Logger.Println(err)
-		}
-		e.Text = textBuff.Bytes()
-		tmpl, err = template.New("text_template").Parse(c.Template.Subject)
-		if err != nil {
-			Logger.Println(err)
-		}
-		err = tmpl.Execute(&subjBuff, td)
-		if err != nil {
-			Logger.Println(err)
-		}
-		e.Subject = string(subjBuff.Bytes())
-		Logger.Println("Creating email using template")
-		e.To = []string{t.Email}
-		Logger.Printf("Sending Email to %s\n", t.Email)
-		err = e.Send(c.SMTP.Host, auth)
-		if err != nil {
-			Logger.Println(err)
-			err = t.UpdateStatus(models.ERROR)
-			if err != nil {
-				Logger.Println(err)
-			}
-			err = c.AddEvent(models.Event{Email: t.Email, Message: models.EVENT_SENDING_ERROR})
-			if err != nil {
-				Logger.Println(err)
-			}
-		} else {
-			err = t.UpdateStatus(models.EVENT_SENT)
-			if err != nil {
-				Logger.Println(err)
-			}
-			err = c.AddEvent(models.Event{Email: t.Email, Message: models.EVENT_SENT})
-			if err != nil {
-				Logger.Println(err)
-			}
-		}
-	}
-	err = c.UpdateStatus(models.CAMPAIGN_EMAILS_SENT)
-	if err != nil {
-		Logger.Println(err)
-	}
-}
-
-func SendTestEmail(s *models.SendTestEmailRequest) error {
-	e := email.Email{
-		Subject: s.Template.Subject,
-		From:    s.SMTP.FromAddress,
-	}
-	var auth smtp.Auth
-	if s.SMTP.Username != "" && s.SMTP.Password != "" {
-		auth = smtp.PlainAuth("", s.SMTP.Username, s.SMTP.Password, strings.Split(s.SMTP.Host, ":")[0])
-	}
-	f, err := mail.ParseAddress(s.SMTP.FromAddress)
-	if err != nil {
-		Logger.Println(err)
+		log.Error(err)
 		return err
 	}
-	ft := f.Name
-	if ft == "" {
-		ft = f.Address
-	}
-	Logger.Println("Creating email using template")
-	// Parse the templates
-	var subjBuff bytes.Buffer
-	var htmlBuff bytes.Buffer
-	var textBuff bytes.Buffer
-	tmpl, err := template.New("html_template").Parse(s.Template.HTML)
+	// Lock the MailLogs (they will be unlocked after processing)
+	err = models.LockMailLogs(ms, true)
 	if err != nil {
-		Logger.Println(err)
+		return err
 	}
-	err = tmpl.Execute(&htmlBuff, s)
+	campaignCache := make(map[int64]models.Campaign)
+	// We'll group the maillogs by campaign ID to (roughly) group
+	// them by sending profile. This lets the mailer re-use the Sender
+	// instead of having to re-connect to the SMTP server for every
+	// email.
+	msg := make(map[int64][]mailer.Mail)
+	for _, m := range ms {
+		// We cache the campaign here to greatly reduce the time it takes to
+		// generate the message (ref #1726)
+		c, ok := campaignCache[m.CampaignId]
+		if !ok {
+			c, err = models.GetCampaignMailContext(m.CampaignId, m.UserId)
+			if err != nil {
+				return err
+			}
+			campaignCache[c.Id] = c
+		}
+		m.CacheCampaign(&c)
+		msg[m.CampaignId] = append(msg[m.CampaignId], m)
+	}
+
+	// Next, we process each group of maillogs in parallel
+	for cid, msc := range msg {
+		go func(cid int64, msc []mailer.Mail) {
+			c := campaignCache[cid]
+			if c.Status == models.CampaignQueued {
+				err := c.UpdateStatus(models.CampaignInProgress)
+				if err != nil {
+					log.Error(err)
+					return
+				}
+			}
+			log.WithFields(logrus.Fields{
+				"num_emails": len(msc),
+			}).Info("Sending emails to mailer for processing")
+			w.mailer.Queue(msc)
+		}(cid, msc)
+	}
+	return nil
+}
+
+// Start launches the worker to poll the database every minute for any pending maillogs
+// that need to be processed.
+func (w *DefaultWorker) Start() {
+	log.Info("Background Worker Started Successfully - Waiting for Campaigns")
+	go w.mailer.Start(context.Background())
+	for t := range time.Tick(1 * time.Minute) {
+		err := w.processCampaigns(t)
+		if err != nil {
+			log.Error(err)
+			continue
+		}
+	}
+}
+
+// LaunchCampaign starts a campaign
+func (w *DefaultWorker) LaunchCampaign(c models.Campaign) {
+	ms, err := models.GetMailLogsByCampaign(c.Id)
 	if err != nil {
-		Logger.Println(err)
+		log.Error(err)
+		return
 	}
-	e.HTML = htmlBuff.Bytes()
-	tmpl, err = template.New("text_template").Parse(s.Template.Text)
+	models.LockMailLogs(ms, true)
+	// This is required since you cannot pass a slice of values
+	// that implements an interface as a slice of that interface.
+	mailEntries := []mailer.Mail{}
+	currentTime := time.Now().UTC()
+	campaignMailCtx, err := models.GetCampaignMailContext(c.Id, c.UserId)
 	if err != nil {
-		Logger.Println(err)
+		log.Error(err)
+		return
 	}
-	err = tmpl.Execute(&textBuff, s)
-	if err != nil {
-		Logger.Println(err)
+	for _, m := range ms {
+		// Only send the emails scheduled to be sent for the past minute to
+		// respect the campaign scheduling options
+		if m.SendDate.After(currentTime) {
+			m.Unlock()
+			continue
+		}
+		err = m.CacheCampaign(&campaignMailCtx)
+		if err != nil {
+			log.Error(err)
+			return
+		}
+		mailEntries = append(mailEntries, m)
 	}
-	e.Text = textBuff.Bytes()
-	tmpl, err = template.New("text_template").Parse(s.Template.Subject)
-	if err != nil {
-		Logger.Println(err)
-	}
-	err = tmpl.Execute(&subjBuff, s)
-	if err != nil {
-		Logger.Println(err)
-	}
-	e.Subject = string(subjBuff.Bytes())
-	e.To = []string{s.Email}
-	Logger.Printf("Sending Email to %s\n", s.Email)
-	err = e.Send(s.SMTP.Host, auth)
-	if err != nil {
-		Logger.Println(err)
-		// For now, let's split the error and return
-		// the last element (the most descriptive error message)
-		serr := strings.Split(err.Error(), ":")
-		return errors.New(serr[len(serr)-1])
-	}
-	return err
+	w.mailer.Queue(mailEntries)
+}
+
+// SendTestEmail sends a test email
+func (w *DefaultWorker) SendTestEmail(s *models.EmailRequest) error {
+	go func() {
+		ms := []mailer.Mail{s}
+		w.mailer.Queue(ms)
+	}()
+	return <-s.ErrorChan
 }

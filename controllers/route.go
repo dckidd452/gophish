@@ -1,357 +1,364 @@
 package controllers
 
 import (
-	"encoding/json"
-	"fmt"
+	"compress/gzip"
+	"context"
+	"crypto/tls"
 	"html/template"
-	"log"
-	"net"
 	"net/http"
 	"net/url"
-	"os"
+	"time"
 
+	"github.com/NYTimes/gziphandler"
 	"github.com/gophish/gophish/auth"
+	"github.com/gophish/gophish/config"
+	ctx "github.com/gophish/gophish/context"
+	"github.com/gophish/gophish/controllers/api"
+	log "github.com/gophish/gophish/logger"
 	mid "github.com/gophish/gophish/middleware"
+	"github.com/gophish/gophish/middleware/ratelimit"
 	"github.com/gophish/gophish/models"
-	ctx "github.com/gorilla/context"
+	"github.com/gophish/gophish/util"
+	"github.com/gophish/gophish/worker"
+	"github.com/gorilla/csrf"
+	"github.com/gorilla/handlers"
 	"github.com/gorilla/mux"
 	"github.com/gorilla/sessions"
-	"github.com/justinas/nosurf"
+	"github.com/jordan-wright/unindexed"
 )
 
-// Logger is used to send logging messages to stdout.
-var Logger = log.New(os.Stdout, " ", log.Ldate|log.Ltime|log.Lshortfile)
+// AdminServerOption is a functional option that is used to configure the
+// admin server
+type AdminServerOption func(*AdminServer)
 
-// CreateAdminRouter creates the routes for handling requests to the web interface.
+// AdminServer is an HTTP server that implements the administrative Gophish
+// handlers, including the dashboard and REST API.
+type AdminServer struct {
+	server  *http.Server
+	worker  worker.Worker
+	config  config.AdminServer
+	limiter *ratelimit.PostLimiter
+}
+
+var defaultTLSConfig = &tls.Config{
+	PreferServerCipherSuites: true,
+	CurvePreferences: []tls.CurveID{
+		tls.X25519,
+		tls.CurveP256,
+	},
+	MinVersion: tls.VersionTLS12,
+	CipherSuites: []uint16{
+		tls.TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384,
+		tls.TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384,
+		tls.TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305,
+		tls.TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305,
+		tls.TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256,
+		tls.TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256,
+
+		// Kept for backwards compatibility with some clients
+		tls.TLS_RSA_WITH_AES_256_GCM_SHA384,
+		tls.TLS_RSA_WITH_AES_128_GCM_SHA256,
+	},
+}
+
+// WithWorker is an option that sets the background worker.
+func WithWorker(w worker.Worker) AdminServerOption {
+	return func(as *AdminServer) {
+		as.worker = w
+	}
+}
+
+// NewAdminServer returns a new instance of the AdminServer with the
+// provided config and options applied.
+func NewAdminServer(config config.AdminServer, options ...AdminServerOption) *AdminServer {
+	defaultWorker, _ := worker.New()
+	defaultServer := &http.Server{
+		ReadTimeout: 10 * time.Second,
+		Addr:        config.ListenURL,
+	}
+	defaultLimiter := ratelimit.NewPostLimiter()
+	as := &AdminServer{
+		worker:  defaultWorker,
+		server:  defaultServer,
+		limiter: defaultLimiter,
+		config:  config,
+	}
+	for _, opt := range options {
+		opt(as)
+	}
+	as.registerRoutes()
+	return as
+}
+
+// Start launches the admin server, listening on the configured address.
+func (as *AdminServer) Start() {
+	if as.worker != nil {
+		go as.worker.Start()
+	}
+	if as.config.UseTLS {
+		// Only support TLS 1.2 and above - ref #1691, #1689
+		as.server.TLSConfig = defaultTLSConfig
+		err := util.CheckAndCreateSSL(as.config.CertPath, as.config.KeyPath)
+		if err != nil {
+			log.Fatal(err)
+		}
+		log.Infof("Starting admin server at https://%s", as.config.ListenURL)
+		log.Fatal(as.server.ListenAndServeTLS(as.config.CertPath, as.config.KeyPath))
+	}
+	// If TLS isn't configured, just listen on HTTP
+	log.Infof("Starting admin server at http://%s", as.config.ListenURL)
+	log.Fatal(as.server.ListenAndServe())
+}
+
+// Shutdown attempts to gracefully shutdown the server.
+func (as *AdminServer) Shutdown() error {
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second*10)
+	defer cancel()
+	return as.server.Shutdown(ctx)
+}
+
+// SetupAdminRoutes creates the routes for handling requests to the web interface.
 // This function returns an http.Handler to be used in http.ListenAndServe().
-func CreateAdminRouter() http.Handler {
+func (as *AdminServer) registerRoutes() {
 	router := mux.NewRouter()
 	// Base Front-end routes
-	router.HandleFunc("/", Use(Base, mid.RequireLogin))
-	router.HandleFunc("/login", Login)
-	router.HandleFunc("/logout", Use(Logout, mid.RequireLogin))
-	router.HandleFunc("/campaigns", Use(Campaigns, mid.RequireLogin))
-	router.HandleFunc("/campaigns/{id:[0-9]+}", Use(CampaignID, mid.RequireLogin))
-	router.HandleFunc("/templates", Use(Templates, mid.RequireLogin))
-	router.HandleFunc("/users", Use(Users, mid.RequireLogin))
-	router.HandleFunc("/landing_pages", Use(LandingPages, mid.RequireLogin))
-	router.HandleFunc("/register", Use(Register, mid.RequireLogin))
-	router.HandleFunc("/settings", Use(Settings, mid.RequireLogin))
+	router.HandleFunc("/", mid.Use(as.Base, mid.RequireLogin))
+	router.HandleFunc("/login", mid.Use(as.Login, as.limiter.Limit))
+	router.HandleFunc("/logout", mid.Use(as.Logout, mid.RequireLogin))
+	router.HandleFunc("/reset_password", mid.Use(as.ResetPassword, mid.RequireLogin))
+	router.HandleFunc("/campaigns", mid.Use(as.Campaigns, mid.RequireLogin))
+	router.HandleFunc("/campaigns/{id:[0-9]+}", mid.Use(as.CampaignID, mid.RequireLogin))
+	router.HandleFunc("/templates", mid.Use(as.Templates, mid.RequireLogin))
+	router.HandleFunc("/groups", mid.Use(as.Groups, mid.RequireLogin))
+	router.HandleFunc("/landing_pages", mid.Use(as.LandingPages, mid.RequireLogin))
+	router.HandleFunc("/sending_profiles", mid.Use(as.SendingProfiles, mid.RequireLogin))
+	router.HandleFunc("/settings", mid.Use(as.Settings, mid.RequireLogin))
+	router.HandleFunc("/users", mid.Use(as.UserManagement, mid.RequirePermission(models.PermissionModifySystem), mid.RequireLogin))
+	router.HandleFunc("/webhooks", mid.Use(as.Webhooks, mid.RequirePermission(models.PermissionModifySystem), mid.RequireLogin))
+	router.HandleFunc("/impersonate", mid.Use(as.Impersonate, mid.RequirePermission(models.PermissionModifySystem), mid.RequireLogin))
 	// Create the API routes
-	api := router.PathPrefix("/api").Subrouter()
-	api = api.StrictSlash(true)
-	api.HandleFunc("/", Use(API, mid.RequireLogin))
-	api.HandleFunc("/reset", Use(API_Reset, mid.RequireLogin))
-	api.HandleFunc("/campaigns/", Use(API_Campaigns, mid.RequireAPIKey))
-	api.HandleFunc("/campaigns/{id:[0-9]+}", Use(API_Campaigns_Id, mid.RequireAPIKey))
-	api.HandleFunc("/groups/", Use(API_Groups, mid.RequireAPIKey))
-	api.HandleFunc("/groups/{id:[0-9]+}", Use(API_Groups_Id, mid.RequireAPIKey))
-	api.HandleFunc("/templates/", Use(API_Templates, mid.RequireAPIKey))
-	api.HandleFunc("/templates/{id:[0-9]+}", Use(API_Templates_Id, mid.RequireAPIKey))
-	api.HandleFunc("/pages/", Use(API_Pages, mid.RequireAPIKey))
-	api.HandleFunc("/pages/{id:[0-9]+}", Use(API_Pages_Id, mid.RequireAPIKey))
-	api.HandleFunc("/util/send_test_email", Use(API_Send_Test_Email, mid.RequireAPIKey))
-	api.HandleFunc("/import/group", API_Import_Group)
-	api.HandleFunc("/import/email", API_Import_Email)
-	api.HandleFunc("/import/site", API_Import_Site)
+	api := api.NewServer(
+		api.WithWorker(as.worker),
+		api.WithLimiter(as.limiter),
+	)
+	router.PathPrefix("/api/").Handler(api)
 
 	// Setup static file serving
-	router.PathPrefix("/").Handler(http.FileServer(http.Dir("./static/")))
+	router.PathPrefix("/").Handler(http.FileServer(unindexed.Dir("./static/")))
 
 	// Setup CSRF Protection
-	csrfHandler := nosurf.New(router)
-	// Exempt API routes and Static files
-	csrfHandler.ExemptGlob("/api/campaigns")
-	csrfHandler.ExemptGlob("/api/campaigns/*")
-	csrfHandler.ExemptGlob("/api/groups")
-	csrfHandler.ExemptGlob("/api/groups/*")
-	csrfHandler.ExemptGlob("/api/templates")
-	csrfHandler.ExemptGlob("/api/templates/*")
-	csrfHandler.ExemptGlob("/api/pages")
-	csrfHandler.ExemptGlob("/api/pages/*")
-	csrfHandler.ExemptGlob("/api/import/*")
-	csrfHandler.ExemptGlob("/api/util/*")
-	csrfHandler.ExemptGlob("/static/*")
-	return Use(csrfHandler.ServeHTTP, mid.GetContext)
+	csrfKey := []byte(as.config.CSRFKey)
+	if len(csrfKey) == 0 {
+		csrfKey = []byte(auth.GenerateSecureKey(auth.APIKeyLength))
+	}
+	csrfHandler := csrf.Protect(csrfKey,
+		csrf.FieldName("csrf_token"),
+		csrf.Secure(as.config.UseTLS))
+	adminHandler := csrfHandler(router)
+	adminHandler = mid.Use(adminHandler.ServeHTTP, mid.CSRFExceptions, mid.GetContext, mid.ApplySecurityHeaders)
+
+	// Setup GZIP compression
+	gzipWrapper, _ := gziphandler.NewGzipLevelHandler(gzip.BestCompression)
+	adminHandler = gzipWrapper(adminHandler)
+
+	// Respect X-Forwarded-For and X-Real-IP headers in case we're behind a
+	// reverse proxy.
+	adminHandler = handlers.ProxyHeaders(adminHandler)
+
+	// Setup logging
+	adminHandler = handlers.CombinedLoggingHandler(log.Writer(), adminHandler)
+	as.server.Handler = adminHandler
 }
 
-// CreatePhishingRouter creates the router that handles phishing connections.
-func CreatePhishingRouter() http.Handler {
-	router := mux.NewRouter()
-	router.PathPrefix("/static").Handler(http.FileServer(http.Dir("./static/endpoint/")))
-	router.HandleFunc("/track", PhishTracker)
-	router.HandleFunc("/{path:.*}", PhishHandler)
-	return router
+type templateParams struct {
+	Title        string
+	Flashes      []interface{}
+	User         models.User
+	Token        string
+	Version      string
+	ModifySystem bool
 }
 
-// PhishTracker tracks emails as they are opened, updating the status for the given Result
-func PhishTracker(w http.ResponseWriter, r *http.Request) {
-	r.ParseForm()
-	id := r.Form.Get("rid")
-	if id == "" {
-		http.NotFound(w, r)
-		return
-	}
-	rs, err := models.GetResult(id)
-	if err != nil {
-		http.NotFound(w, r)
-		return
-	}
-	c, err := models.GetCampaign(rs.CampaignId, rs.UserId)
-	if err != nil {
-		Logger.Println(err)
-	}
-	c.AddEvent(models.Event{Email: rs.Email, Message: models.EVENT_OPENED})
-	// Don't update the status if the user already clicked the link
-	// or submitted data to the campaign
-	if rs.Status == models.STATUS_SUCCESS {
-		w.Write([]byte(""))
-		return
-	}
-	err = rs.UpdateStatus(models.EVENT_OPENED)
-	if err != nil {
-		Logger.Println(err)
-	}
-	// Update the GeoIP information
-	ip, _, err := net.SplitHostPort(r.RemoteAddr)
-	if err == nil {
-		err = rs.UpdateGeo(ip)
-		if err != nil {
-			Logger.Println(err)
-		}
-	} else {
-		Logger.Println(err)
-	}
-	w.Write([]byte(""))
-}
-
-// PhishHandler handles incoming client connections and registers the associated actions performed
-// (such as clicked link, etc.)
-func PhishHandler(w http.ResponseWriter, r *http.Request) {
-	err := r.ParseForm()
-	if err != nil {
-		Logger.Println(err)
-		http.NotFound(w, r)
-		return
-	}
-	id := r.Form.Get("rid")
-	if id == "" {
-		http.NotFound(w, r)
-		return
-	}
-	rs, err := models.GetResult(id)
-	if err != nil {
-		http.NotFound(w, r)
-		return
-	}
-	rs.UpdateStatus(models.STATUS_SUCCESS)
-	c, err := models.GetCampaign(rs.CampaignId, rs.UserId)
-	if err != nil {
-		Logger.Println(err)
-	}
-	p, err := models.GetPage(c.PageId, c.UserId)
-	if err != nil {
-		Logger.Println(err)
-	}
-	switch {
-	case r.Method == "GET":
-		err = c.AddEvent(models.Event{Email: rs.Email, Message: models.EVENT_CLICKED})
-		if err != nil {
-			Logger.Println(err)
-		}
-	case r.Method == "POST":
-		// If data was POST'ed, let's record it
-		// Store the data in an event
-		d := struct {
-			Payload url.Values        `json:"payload"`
-			Browser map[string]string `json:"browser"`
-		}{
-			Payload: r.Form,
-		}
-		rj, err := json.Marshal(d)
-		if err != nil {
-			Logger.Println(err)
-			http.NotFound(w, r)
-			return
-		}
-		c.AddEvent(models.Event{Email: rs.Email, Message: models.EVENT_DATA_SUBMIT, Details: string(rj)})
-		if err != nil {
-			Logger.Println(err)
-		}
-	}
-	w.Write([]byte(p.HTML))
-}
-
-// Use allows us to stack middleware to process the request
-// Example taken from https://github.com/gorilla/mux/pull/36#issuecomment-25849172
-func Use(handler http.HandlerFunc, mid ...func(http.Handler) http.HandlerFunc) http.HandlerFunc {
-	for _, m := range mid {
-		handler = m(handler)
-	}
-	return handler
-}
-
-// Register creates a new user
-func Register(w http.ResponseWriter, r *http.Request) {
-	// If it is a post request, attempt to register the account
-	// Now that we are all registered, we can log the user in
-	params := struct {
-		Title   string
-		Flashes []interface{}
-		User    models.User
-		Token   string
-	}{Title: "Register", Token: nosurf.Token(r)}
+// newTemplateParams returns the default template parameters for a user and
+// the CSRF token.
+func newTemplateParams(r *http.Request) templateParams {
+	user := ctx.Get(r, "user").(models.User)
 	session := ctx.Get(r, "session").(*sessions.Session)
-	switch {
-	case r.Method == "GET":
-		params.Flashes = session.Flashes()
-		session.Save(r, w)
-		templates := template.New("template")
-		_, err := templates.ParseFiles("templates/register.html", "templates/flashes.html")
-		if err != nil {
-			Logger.Println(err)
-		}
-		template.Must(templates, err).ExecuteTemplate(w, "base", params)
-	case r.Method == "POST":
-		//Attempt to register
-		succ, err := auth.Register(r)
-		//If we've registered, redirect to the login page
-		if succ {
-			session.AddFlash(models.Flash{
-				Type:    "success",
-				Message: "Registration successful!.",
-			})
-			session.Save(r, w)
-			http.Redirect(w, r, "/login", 302)
-		} else {
-			// Check the error
-			m := ""
-			if err == models.ErrUsernameTaken {
-				m = "Username already taken"
-			} else {
-				m = "Unknown error - please try again"
-				Logger.Println(err)
-			}
-			session.AddFlash(models.Flash{
-				Type:    "danger",
-				Message: m,
-			})
-			session.Save(r, w)
-			http.Redirect(w, r, "/register", 302)
-		}
-
+	modifySystem, _ := user.HasPermission(models.PermissionModifySystem)
+	return templateParams{
+		Token:        csrf.Token(r),
+		User:         user,
+		ModifySystem: modifySystem,
+		Version:      config.Version,
+		Flashes:      session.Flashes(),
 	}
 }
 
 // Base handles the default path and template execution
-func Base(w http.ResponseWriter, r *http.Request) {
-	params := struct {
-		User    models.User
-		Title   string
-		Flashes []interface{}
-		Token   string
-	}{Title: "Dashboard", User: ctx.Get(r, "user").(models.User), Token: nosurf.Token(r)}
+func (as *AdminServer) Base(w http.ResponseWriter, r *http.Request) {
+	params := newTemplateParams(r)
+	params.Title = "Dashboard"
 	getTemplate(w, "dashboard").ExecuteTemplate(w, "base", params)
 }
 
 // Campaigns handles the default path and template execution
-func Campaigns(w http.ResponseWriter, r *http.Request) {
-	// Example of using session - will be removed.
-	params := struct {
-		User    models.User
-		Title   string
-		Flashes []interface{}
-		Token   string
-	}{Title: "Campaigns", User: ctx.Get(r, "user").(models.User), Token: nosurf.Token(r)}
+func (as *AdminServer) Campaigns(w http.ResponseWriter, r *http.Request) {
+	params := newTemplateParams(r)
+	params.Title = "Campaigns"
 	getTemplate(w, "campaigns").ExecuteTemplate(w, "base", params)
 }
 
 // CampaignID handles the default path and template execution
-func CampaignID(w http.ResponseWriter, r *http.Request) {
-	// Example of using session - will be removed.
-	params := struct {
-		User    models.User
-		Title   string
-		Flashes []interface{}
-		Token   string
-	}{Title: "Dashboard", User: ctx.Get(r, "user").(models.User), Token: nosurf.Token(r)}
+func (as *AdminServer) CampaignID(w http.ResponseWriter, r *http.Request) {
+	params := newTemplateParams(r)
+	params.Title = "Campaign Results"
 	getTemplate(w, "campaign_results").ExecuteTemplate(w, "base", params)
 }
 
 // Templates handles the default path and template execution
-func Templates(w http.ResponseWriter, r *http.Request) {
-	// Example of using session - will be removed.
-	params := struct {
-		User    models.User
-		Title   string
-		Flashes []interface{}
-		Token   string
-	}{Title: "Dashboard", User: ctx.Get(r, "user").(models.User), Token: nosurf.Token(r)}
+func (as *AdminServer) Templates(w http.ResponseWriter, r *http.Request) {
+	params := newTemplateParams(r)
+	params.Title = "Email Templates"
 	getTemplate(w, "templates").ExecuteTemplate(w, "base", params)
 }
 
-// Users handles the default path and template execution
-func Users(w http.ResponseWriter, r *http.Request) {
-	// Example of using session - will be removed.
-	params := struct {
-		User    models.User
-		Title   string
-		Flashes []interface{}
-		Token   string
-	}{Title: "Dashboard", User: ctx.Get(r, "user").(models.User), Token: nosurf.Token(r)}
-	getTemplate(w, "users").ExecuteTemplate(w, "base", params)
+// Groups handles the default path and template execution
+func (as *AdminServer) Groups(w http.ResponseWriter, r *http.Request) {
+	params := newTemplateParams(r)
+	params.Title = "Users & Groups"
+	getTemplate(w, "groups").ExecuteTemplate(w, "base", params)
 }
 
 // LandingPages handles the default path and template execution
-func LandingPages(w http.ResponseWriter, r *http.Request) {
-	// Example of using session - will be removed.
+func (as *AdminServer) LandingPages(w http.ResponseWriter, r *http.Request) {
+	params := newTemplateParams(r)
+	params.Title = "Landing Pages"
+	getTemplate(w, "landing_pages").ExecuteTemplate(w, "base", params)
+}
+
+// SendingProfiles handles the default path and template execution
+func (as *AdminServer) SendingProfiles(w http.ResponseWriter, r *http.Request) {
+	params := newTemplateParams(r)
+	params.Title = "Sending Profiles"
+	getTemplate(w, "sending_profiles").ExecuteTemplate(w, "base", params)
+}
+
+// Settings handles the changing of settings
+func (as *AdminServer) Settings(w http.ResponseWriter, r *http.Request) {
+	switch {
+	case r.Method == "GET":
+		params := newTemplateParams(r)
+		params.Title = "Settings"
+		session := ctx.Get(r, "session").(*sessions.Session)
+		session.Save(r, w)
+		getTemplate(w, "settings").ExecuteTemplate(w, "base", params)
+	case r.Method == "POST":
+		u := ctx.Get(r, "user").(models.User)
+		currentPw := r.FormValue("current_password")
+		newPassword := r.FormValue("new_password")
+		confirmPassword := r.FormValue("confirm_new_password")
+		// Check the current password
+		err := auth.ValidatePassword(currentPw, u.Hash)
+		msg := models.Response{Success: true, Message: "Settings Updated Successfully"}
+		if err != nil {
+			msg.Message = err.Error()
+			msg.Success = false
+			api.JSONResponse(w, msg, http.StatusBadRequest)
+			return
+		}
+		newHash, err := auth.ValidatePasswordChange(u.Hash, newPassword, confirmPassword)
+		if err != nil {
+			msg.Message = err.Error()
+			msg.Success = false
+			api.JSONResponse(w, msg, http.StatusBadRequest)
+			return
+		}
+		u.Hash = string(newHash)
+		if err = models.PutUser(&u); err != nil {
+			msg.Message = err.Error()
+			msg.Success = false
+			api.JSONResponse(w, msg, http.StatusInternalServerError)
+			return
+		}
+		api.JSONResponse(w, msg, http.StatusOK)
+	}
+}
+
+// UserManagement is an admin-only handler that allows for the registration
+// and management of user accounts within Gophish.
+func (as *AdminServer) UserManagement(w http.ResponseWriter, r *http.Request) {
+	params := newTemplateParams(r)
+	params.Title = "User Management"
+	getTemplate(w, "users").ExecuteTemplate(w, "base", params)
+}
+
+func (as *AdminServer) nextOrIndex(w http.ResponseWriter, r *http.Request) {
+	next := "/"
+	url, err := url.Parse(r.FormValue("next"))
+	if err == nil {
+		path := url.Path
+		if path != "" {
+			next = path
+		}
+	}
+	http.Redirect(w, r, next, 302)
+}
+
+func (as *AdminServer) handleInvalidLogin(w http.ResponseWriter, r *http.Request, message string) {
+	session := ctx.Get(r, "session").(*sessions.Session)
+	Flash(w, r, "danger", message)
 	params := struct {
 		User    models.User
 		Title   string
 		Flashes []interface{}
 		Token   string
-	}{Title: "Dashboard", User: ctx.Get(r, "user").(models.User), Token: nosurf.Token(r)}
-	getTemplate(w, "landing_pages").ExecuteTemplate(w, "base", params)
+	}{Title: "Login", Token: csrf.Token(r)}
+	params.Flashes = session.Flashes()
+	session.Save(r, w)
+	templates := template.New("template")
+	_, err := templates.ParseFiles("templates/login.html", "templates/flashes.html")
+	if err != nil {
+		log.Error(err)
+	}
+	// w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	w.WriteHeader(http.StatusUnauthorized)
+	template.Must(templates, err).ExecuteTemplate(w, "base", params)
 }
 
-// Settings handles the changing of settings
-func Settings(w http.ResponseWriter, r *http.Request) {
-	switch {
-	case r.Method == "GET":
-		params := struct {
-			User    models.User
-			Title   string
-			Flashes []interface{}
-			Token   string
-		}{Title: "Dashboard", User: ctx.Get(r, "user").(models.User), Token: nosurf.Token(r)}
-		getTemplate(w, "settings").ExecuteTemplate(w, "base", params)
-	case r.Method == "POST":
-		err := auth.ChangePassword(r)
-		msg := models.Response{Success: true, Message: "Settings Updated Successfully"}
-		if err == auth.ErrInvalidPassword {
-			msg.Message = "Invalid Password"
-			msg.Success = false
-			JSONResponse(w, msg, http.StatusBadRequest)
-			return
-		} else if err != nil {
-			msg.Message = "Unknown Error Occured"
-			msg.Success = false
-			JSONResponse(w, msg, http.StatusBadRequest)
+// Webhooks is an admin-only handler that handles webhooks
+func (as *AdminServer) Webhooks(w http.ResponseWriter, r *http.Request) {
+	params := newTemplateParams(r)
+	params.Title = "Webhooks"
+	getTemplate(w, "webhooks").ExecuteTemplate(w, "base", params)
+}
+
+// Impersonate allows an admin to login to a user account without needing the password
+func (as *AdminServer) Impersonate(w http.ResponseWriter, r *http.Request) {
+
+	if r.Method == "POST" {
+		username := r.FormValue("username")
+		u, err := models.GetUserByUsername(username)
+		if err != nil {
+			log.Error(err)
+			http.Error(w, err.Error(), http.StatusNotFound)
 			return
 		}
-		JSONResponse(w, msg, http.StatusOK)
+		session := ctx.Get(r, "session").(*sessions.Session)
+		session.Values["id"] = u.Id
+		session.Save(r, w)
 	}
+	http.Redirect(w, r, "/", http.StatusFound)
 }
 
 // Login handles the authentication flow for a user. If credentials are valid,
 // a session is created
-func Login(w http.ResponseWriter, r *http.Request) {
+func (as *AdminServer) Login(w http.ResponseWriter, r *http.Request) {
 	params := struct {
 		User    models.User
 		Title   string
 		Flashes []interface{}
 		Token   string
-	}{Title: "Login", Token: nosurf.Token(r)}
+	}{Title: "Login", Token: csrf.Token(r)}
 	session := ctx.Get(r, "session").(*sessions.Session)
 	switch {
 	case r.Method == "GET":
@@ -360,61 +367,118 @@ func Login(w http.ResponseWriter, r *http.Request) {
 		templates := template.New("template")
 		_, err := templates.ParseFiles("templates/login.html", "templates/flashes.html")
 		if err != nil {
-			Logger.Println(err)
+			log.Error(err)
 		}
 		template.Must(templates, err).ExecuteTemplate(w, "base", params)
 	case r.Method == "POST":
-		//Attempt to login
-		succ, err := auth.Login(r)
+		// Find the user with the provided username
+		username, password := r.FormValue("username"), r.FormValue("password")
+		u, err := models.GetUserByUsername(username)
 		if err != nil {
-			Logger.Println(err)
+			log.Error(err)
+			as.handleInvalidLogin(w, r, "Invalid Username/Password")
+			return
 		}
-		//If we've logged in, save the session and redirect to the dashboard
-		if succ {
-			session.Save(r, w)
-			http.Redirect(w, r, "/", 302)
-		} else {
-			Flash(w, r, "danger", "Invalid Username/Password")
-			http.Redirect(w, r, "/login", 302)
+		// Validate the user's password
+		err = auth.ValidatePassword(password, u.Hash)
+		if err != nil {
+			log.Error(err)
+			as.handleInvalidLogin(w, r, "Invalid Username/Password")
+			return
 		}
+		if u.AccountLocked == true {
+			as.handleInvalidLogin(w, r, "Account Locked")
+			return
+		}
+		u.LastLogin = time.Now().UTC()
+		err = models.PutUser(&u)
+		if err != nil {
+			log.Error(err)
+		}
+		// If we've logged in, save the session and redirect to the dashboard
+		session.Values["id"] = u.Id
+		session.Save(r, w)
+		as.nextOrIndex(w, r)
 	}
 }
 
 // Logout destroys the current user session
-func Logout(w http.ResponseWriter, r *http.Request) {
-	// If it is a post request, attempt to register the account
-	// Now that we are all registered, we can log the user in
+func (as *AdminServer) Logout(w http.ResponseWriter, r *http.Request) {
 	session := ctx.Get(r, "session").(*sessions.Session)
 	delete(session.Values, "id")
 	Flash(w, r, "success", "You have successfully logged out")
-	http.Redirect(w, r, "/login", 302)
+	session.Save(r, w)
+	http.Redirect(w, r, "/login", http.StatusFound)
 }
 
-// Preview allows for the viewing of page html in a separate browser window
-func Preview(w http.ResponseWriter, r *http.Request) {
-	if r.Method != "POST" {
-		http.Error(w, "Method not allowed", http.StatusBadRequest)
+// ResetPassword handles the password reset flow when a password change is
+// required either by the Gophish system or an administrator.
+//
+// This handler is meant to be used when a user is required to reset their
+// password, not just when they want to.
+//
+// This is an important distinction since in this handler we don't require
+// the user to re-enter their current password, as opposed to the flow
+// through the settings handler.
+//
+// To that end, if the user doesn't require a password change, we will
+// redirect them to the settings page.
+func (as *AdminServer) ResetPassword(w http.ResponseWriter, r *http.Request) {
+	u := ctx.Get(r, "user").(models.User)
+	session := ctx.Get(r, "session").(*sessions.Session)
+	if !u.PasswordChangeRequired {
+		Flash(w, r, "info", "Please reset your password through the settings page")
+		session.Save(r, w)
+		http.Redirect(w, r, "/settings", http.StatusTemporaryRedirect)
+		return
 	}
-	fmt.Fprintf(w, "%s", r.FormValue("html"))
+	params := newTemplateParams(r)
+	params.Title = "Reset Password"
+	switch {
+	case r.Method == http.MethodGet:
+		params.Flashes = session.Flashes()
+		session.Save(r, w)
+		getTemplate(w, "reset_password").ExecuteTemplate(w, "base", params)
+		return
+	case r.Method == http.MethodPost:
+		newPassword := r.FormValue("password")
+		confirmPassword := r.FormValue("confirm_password")
+		newHash, err := auth.ValidatePasswordChange(u.Hash, newPassword, confirmPassword)
+		if err != nil {
+			Flash(w, r, "danger", err.Error())
+			params.Flashes = session.Flashes()
+			session.Save(r, w)
+			w.WriteHeader(http.StatusBadRequest)
+			getTemplate(w, "reset_password").ExecuteTemplate(w, "base", params)
+			return
+		}
+		u.PasswordChangeRequired = false
+		u.Hash = newHash
+		if err = models.PutUser(&u); err != nil {
+			Flash(w, r, "danger", err.Error())
+			params.Flashes = session.Flashes()
+			session.Save(r, w)
+			w.WriteHeader(http.StatusInternalServerError)
+			getTemplate(w, "reset_password").ExecuteTemplate(w, "base", params)
+			return
+		}
+		// TODO: We probably want to flash a message here that the password was
+		// changed successfully. The problem is that when the user resets their
+		// password on first use, they will see two flashes on the dashboard-
+		// one for their password reset, and one for the "no campaigns created".
+		//
+		// The solution to this is to revamp the empty page to be more useful,
+		// like a wizard or something.
+		as.nextOrIndex(w, r)
+	}
 }
 
-// Clone takes a URL as a POST parameter and returns the site HTML
-func Clone(w http.ResponseWriter, r *http.Request) {
-	vars := mux.Vars(r)
-	if r.Method != "POST" {
-		http.Error(w, "Method not allowed", http.StatusBadRequest)
-	}
-	if url, ok := vars["url"]; ok {
-		Logger.Println(url)
-	}
-	http.Error(w, "No URL given.", http.StatusBadRequest)
-}
-
+// TODO: Make this execute the template, too
 func getTemplate(w http.ResponseWriter, tmpl string) *template.Template {
 	templates := template.New("template")
-	_, err := templates.ParseFiles("templates/base.html", "templates/"+tmpl+".html", "templates/flashes.html")
+	_, err := templates.ParseFiles("templates/base.html", "templates/nav.html", "templates/"+tmpl+".html", "templates/flashes.html")
 	if err != nil {
-		Logger.Println(err)
+		log.Error(err)
 	}
 	return template.Must(templates, err)
 }
@@ -426,5 +490,4 @@ func Flash(w http.ResponseWriter, r *http.Request, t string, m string) {
 		Type:    t,
 		Message: m,
 	})
-	session.Save(r, w)
 }

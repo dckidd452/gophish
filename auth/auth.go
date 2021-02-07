@@ -1,104 +1,103 @@
 package auth
 
 import (
-	"encoding/gob"
+	"crypto/rand"
 	"errors"
 	"fmt"
 	"io"
-	"net/http"
 
-	"crypto/rand"
-
-	"github.com/gophish/gophish/models"
-	ctx "github.com/gorilla/context"
-	"github.com/gorilla/securecookie"
-	"github.com/gorilla/sessions"
 	"golang.org/x/crypto/bcrypt"
 )
 
-//init registers the necessary models to be saved in the session later
-func init() {
-	gob.Register(&models.User{})
-	gob.Register(&models.Flash{})
-}
+// MinPasswordLength is the minimum number of characters required in a password
+const MinPasswordLength = 8
 
-// Store contains the session information for the request
-var Store = sessions.NewCookieStore(
-	[]byte(securecookie.GenerateRandomKey(64)), //Signing key
-	[]byte(securecookie.GenerateRandomKey(32)))
+// APIKeyLength is the length of Gophish API keys
+const APIKeyLength = 32
 
 // ErrInvalidPassword is thrown when a user provides an incorrect password.
 var ErrInvalidPassword = errors.New("Invalid Password")
 
-// Login attempts to login the user given a request.
-func Login(r *http.Request) (bool, error) {
-	username, password := r.FormValue("username"), r.FormValue("password")
-	session, _ := Store.Get(r, "gophish")
-	u, err := models.GetUserByUsername(username)
-	if err != nil && err != models.ErrUsernameTaken {
-		return false, err
-	}
-	//If we've made it here, we should have a valid user stored in u
-	//Let's check the password
-	err = bcrypt.CompareHashAndPassword([]byte(u.Hash), []byte(password))
-	if err != nil {
-		ctx.Set(r, "user", nil)
-		return false, ErrInvalidPassword
-	}
-	ctx.Set(r, "user", u)
-	session.Values["id"] = u.Id
-	return true, nil
-}
+// ErrPasswordMismatch is thrown when a user provides a mismatching password
+// and confirmation password.
+var ErrPasswordMismatch = errors.New("Passwords do not match")
 
-// Register attempts to register the user given a request.
-func Register(r *http.Request) (bool, error) {
-	username, password := r.FormValue("username"), r.FormValue("password")
-	u, err := models.GetUserByUsername(username)
-	// If we have an error which is not simply indicating that no user was found, report it
-	if err != nil {
-		fmt.Println(err)
-		return false, err
-	}
-	u = models.User{}
-	//If we've made it here, we should have a valid username given
-	//Let's create the password hash
-	h, err := bcrypt.GenerateFromPassword([]byte(password), bcrypt.DefaultCost)
-	if err != nil {
-		return false, err
-	}
-	u.Username = username
-	u.Hash = string(h)
-	u.ApiKey = GenerateSecureKey()
-	err = models.PutUser(&u)
-	return true, nil
-}
+// ErrReusedPassword is thrown when a user attempts to change their password to
+// the existing password
+var ErrReusedPassword = errors.New("Cannot reuse existing password")
 
-// GenerateSecureKey creates a secure key to use
-// as an API key
-func GenerateSecureKey() string {
-	// Inspired from gorilla/securecookie
-	k := make([]byte, 32)
+// ErrEmptyPassword is thrown when a user provides a blank password to the register
+// or change password functions
+var ErrEmptyPassword = errors.New("No password provided")
+
+// ErrPasswordTooShort is thrown when a user provides a password that is less
+// than MinPasswordLength
+var ErrPasswordTooShort = fmt.Errorf("Password must be at least %d characters", MinPasswordLength)
+
+// GenerateSecureKey returns the hex representation of key generated from n
+// random bytes
+func GenerateSecureKey(n int) string {
+	k := make([]byte, n)
 	io.ReadFull(rand.Reader, k)
 	return fmt.Sprintf("%x", k)
 }
 
-func ChangePassword(r *http.Request) error {
-	u := ctx.Get(r, "user").(models.User)
-	c, n := r.FormValue("current_password"), r.FormValue("new_password")
-	// Check the current password
-	err := bcrypt.CompareHashAndPassword([]byte(u.Hash), []byte(c))
+// GeneratePasswordHash returns the bcrypt hash for the provided password using
+// the default bcrypt cost.
+func GeneratePasswordHash(password string) (string, error) {
+	h, err := bcrypt.GenerateFromPassword([]byte(password), bcrypt.DefaultCost)
 	if err != nil {
-		return ErrInvalidPassword
-	} else {
-		// Generate the new hash
-		h, err := bcrypt.GenerateFromPassword([]byte(n), bcrypt.DefaultCost)
-		if err != nil {
-			return err
-		}
-		u.Hash = string(h)
-		if err = models.PutUser(&u); err != nil {
-			return err
-		}
-		return nil
+		return "", err
 	}
+	return string(h), nil
+}
+
+// CheckPasswordPolicy ensures the provided password is valid according to our
+// password policy.
+//
+// The current password policy is simply a minimum of 8 characters, though this
+// may change in the future (see #1538).
+func CheckPasswordPolicy(password string) error {
+	switch {
+	// Admittedly, empty passwords are a subset of too short passwords, but it
+	// helps to provide a more specific error message
+	case password == "":
+		return ErrEmptyPassword
+	case len(password) < MinPasswordLength:
+		return ErrPasswordTooShort
+	}
+	return nil
+}
+
+// ValidatePassword validates that the provided password matches the provided
+// bcrypt hash.
+func ValidatePassword(password string, hash string) error {
+	return bcrypt.CompareHashAndPassword([]byte(hash), []byte(password))
+}
+
+// ValidatePasswordChange validates that the new password matches the
+// configured password policy, that the new password and confirmation
+// password match.
+//
+// Note that this assumes the current password has been confirmed by the
+// caller.
+//
+// If all of the provided data is valid, then the hash of the new password is
+// returned.
+func ValidatePasswordChange(currentHash, newPassword, confirmPassword string) (string, error) {
+	// Ensure the new password passes our password policy
+	if err := CheckPasswordPolicy(newPassword); err != nil {
+		return "", err
+	}
+	// Check that new passwords match
+	if newPassword != confirmPassword {
+		return "", ErrPasswordMismatch
+	}
+	// Make sure that the new password isn't the same as the old one
+	err := ValidatePassword(newPassword, currentHash)
+	if err == nil {
+		return "", ErrReusedPassword
+	}
+	// Generate the new hash
+	return GeneratePasswordHash(newPassword)
 }

@@ -2,23 +2,19 @@ package config
 
 import (
 	"encoding/json"
-	"fmt"
 	"io/ioutil"
-)
 
-// SMTPServer represents the SMTP configuration details
-type SMTPServer struct {
-	Host     string `json:"host"`
-	User     string `json:"user"`
-	Password string `json:"password"`
-}
+	log "github.com/gophish/gophish/logger"
+)
 
 // AdminServer represents the Admin server configuration details
 type AdminServer struct {
-	ListenURL string `json:"listen_url"`
-	UseTLS    bool   `json:"use_tls"`
-	CertPath  string `json:"cert_path"`
-	KeyPath   string `json:"key_path"`
+	ListenURL            string   `json:"listen_url"`
+	UseTLS               bool     `json:"use_tls"`
+	CertPath             string   `json:"cert_path"`
+	KeyPath              string   `json:"key_path"`
+	CSRFKey              string   `json:"csrf_key"`
+	AllowedInternalHosts []string `json:"allowed_internal_hosts"`
 }
 
 // PhishServer represents the Phish server configuration details
@@ -33,19 +29,39 @@ type PhishServer struct {
 type Config struct {
 	AdminConf      AdminServer `json:"admin_server"`
 	PhishConf      PhishServer `json:"phish_server"`
-	SMTPConf       SMTPServer  `json:"smtp"`
+	DBName         string      `json:"db_name"`
 	DBPath         string      `json:"db_path"`
-	MigrationsPath string      `json:"migrations_path"`
+	DBSSLCaPath    string      `json:"db_sslca_path"`
+	MigrationsPath string      `json:"migrations_prefix"`
+	TestFlag       bool        `json:"test_flag"`
+	ContactAddress string      `json:"contact_address"`
+	Logging        *log.Config `json:"logging"`
 }
 
-// Conf contains the initialized configuration struct
-var Conf Config
+// Version contains the current gophish version
+var Version = ""
 
-func init() {
+// ServerName is the server type that is returned in the transparency response.
+const ServerName = "gophish"
+
+// LoadConfig loads the configuration from the specified filepath
+func LoadConfig(filepath string) (*Config, error) {
 	// Get the config file
-	config_file, err := ioutil.ReadFile("./config.json")
+	configFile, err := ioutil.ReadFile(filepath)
 	if err != nil {
-		fmt.Printf("File error: %v\n", err)
+		return nil, err
 	}
-	json.Unmarshal(config_file, &Conf)
+	config := &Config{}
+	err = json.Unmarshal(configFile, config)
+	if err != nil {
+		return nil, err
+	}
+	if config.Logging == nil {
+		config.Logging = &log.Config{}
+	}
+	// Choosing the migrations directory based on the database used.
+	config.MigrationsPath = config.MigrationsPath + config.DBName
+	// Explicitly set the TestFlag to false to prevent config.json overrides
+	config.TestFlag = false
+	return config, nil
 }
